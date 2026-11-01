@@ -234,7 +234,8 @@ namespace CalDavSynchronizer.Implementation.Tasks
                 // that same CalDAV resource.
                 var terminalMasters =
                     seriesGroup
-                        .Where(t => t.IsRecurring && t.IsDeadOccurrence)
+                        .Where(t => t.IsRecurring && t.IsDeadOccurrence &&
+                                    IsConfirmedFiniteTerminalOccurrence(t))
                         .ToList();
 
                 if (terminalMasters.Count == 1)
@@ -292,6 +293,42 @@ namespace CalDavSynchronizer.Implementation.Tasks
             return representatives;
         }
 
+        // PR481 DELETE GUARD: A missing live master is NOT evidence that the last
+        // completed/dead item should become a new master. An unbounded series may
+        // have been explicitly deleted by the user. Only a demonstrably terminal
+        // occurrence of a finite series can act as the last representative.
+        private bool IsConfirmedFiniteTerminalOccurrence(TaskSlim taskInfo)
+        {
+            var task = _session.GetTaskItemOrNull(
+                taskInfo.EntityVersion.Id, _folderId, _folderStoreId);
+            if (task == null)
+                return false;
+
+            Microsoft.Office.Interop.Outlook.RecurrencePattern pattern = null;
+            try
+            {
+                if (!task.IsRecurring || !task.Complete ||
+                    task.StartDate == OutlookUtility.OUTLOOK_DATE_NONE)
+                    return false;
+
+                pattern = task.GetRecurrencePattern();
+                return !pattern.NoEndDate &&
+                       task.StartDate.Date >= pattern.PatternEndDate.Date;
+            }
+            catch (COMException ex)
+            {
+                s_logger.Warn(
+                    "Cannot confirm final finite recurring task occurrence; " +
+                    "refusing to promote a dead occurrence to series master.", ex);
+                return false;
+            }
+            finally
+            {
+                if (pattern != null)
+                    Marshal.FinalReleaseComObject(pattern);
+                Marshal.FinalReleaseComObject(task);
+            }
+        }
         private DateTime? GetTaskOccurrenceDate(TaskSlim taskInfo)
         {
             var task =
@@ -369,18 +406,28 @@ namespace CalDavSynchronizer.Implementation.Tasks
             var seriesRepresentatives =
                 GetUnambiguousSeriesRepresentatives(tasks);
 
+                        var knownIds = new HashSet<string>(
+                idsOfknownEntities, StringComparer.Ordinal);
             var topLevelTasks =
                 tasks.Where(t =>
                 {
+                    // PR481 DELETE GUARD: An unlinked recurring dead occurrence
+                    // may remain after the user deleted the live series master.
+                    // Do not create a fresh CalDAV resource for a new orphan.
+                    if (t.IsRecurring && t.IsDeadOccurrence &&
+                        string.IsNullOrEmpty(t.SeriesId))
+                        return knownIds.Contains(t.EntityVersion.Id);
+
                     if (!t.IsDeadOccurrence || string.IsNullOrEmpty(t.SeriesId))
                         return true;
-
                     TaskSlim representative;
-                    return !seriesRepresentatives.TryGetValue(t.SeriesId, out representative) ||
+                    // Without a confirmed representative, do not upload each
+                    // completed occurrence as an independent recurring series.
+                    return seriesRepresentatives.TryGetValue(t.SeriesId, out representative) &&
                            string.Equals(
-                               representative.EntityVersion.Id,
-                               t.EntityVersion.Id,
-                               StringComparison.Ordinal);
+                                representative.EntityVersion.Id,
+                                t.EntityVersion.Id,
+                                StringComparison.Ordinal);
                 });
 
             return Task.FromResult<IEnumerable<EntityVersion<string, DateTime>>>(
@@ -453,18 +500,30 @@ namespace CalDavSynchronizer.Implementation.Tasks
                     if (!currentById.TryGetValue(inputId.Id, out taskInfo))
                         previousById.TryGetValue(inputId.Id, out taskInfo);
 
+                    if (taskInfo != null && taskInfo.IsRecurring &&
+                        taskInfo.IsDeadOccurrence &&
+                        string.IsNullOrEmpty(taskInfo.SeriesId))
+                    {
+                        s_logger.Warn(
+                            "Ignoring an unlinked recurring dead occurrence in partial sync; " +
+                            "it must not resurrect a deleted recurring series.");
+                        continue;
+                    }
                     TaskSlim representative;
                     if (taskInfo != null &&
                         taskInfo.IsDeadOccurrence &&
-                        !string.IsNullOrEmpty(taskInfo.SeriesId) &&
-                        representativeBySeriesId.TryGetValue(
-                            taskInfo.SeriesId,
-                            out representative))
+                        !string.IsNullOrEmpty(taskInfo.SeriesId))
                     {
-                        // The version/deletion hints belong to a completed occurrence, not
-                        // necessarily to the item which currently represents the series.
-                        // During the final occurrence there is no next live master, so the
-                        // recurring dead occurrence itself becomes the series representative.
+                        if (!representativeBySeriesId.TryGetValue(
+                                taskInfo.SeriesId, out representative))
+                        {
+                            // PR481 DELETE GUARD: a deleted live series must not
+                            // be recreated from a remaining dead occurrence.
+                            s_logger.Warn(
+                                "Ignoring orphan recurring dead occurrence in partial sync; " +
+                                "no unambiguous series master is available.");
+                            continue;
+                        }
                         outputId = representative.EntityVersion.Id;
                         forceReload = true;
                     }
@@ -639,7 +698,44 @@ namespace CalDavSynchronizer.Implementation.Tasks
 
             using (var entity = entityWithId.Entity)
             {
-                entity.Inner.Delete();
+                var master = entity.Inner;
+                var seriesId = master.IsRecurring
+                    ? RecurringTaskSeries.GetSeriesId(master)
+                    : null;
+                if (!string.IsNullOrEmpty(seriesId))
+                {
+                    // PR481 DELETE GUARD: remove only explicitly linked dead
+                    // occurrences. Never infer linkage from title/date alone.
+                    var linkedIds = QueryTasks(NullGetVersionsLogger.Instance)
+                        .Where(t => t.IsRecurring && t.IsDeadOccurrence &&
+                            string.Equals(t.SeriesId, seriesId, StringComparison.Ordinal) &&
+                            !string.Equals(t.EntityVersion.Id, entityId, StringComparison.Ordinal))
+                        .Select(t => t.EntityVersion.Id)
+                        .Distinct(StringComparer.Ordinal)
+                        .ToList();
+                    foreach (var linkedId in linkedIds)
+                    {
+                        var dead = _session.GetTaskItemOrNull(
+                            linkedId, _folderId, _folderStoreId);
+                        if (dead == null)
+                            continue;
+                        try
+                        {
+                            // Recheck before deleting this Outlook item.
+                            if (dead.IsRecurring &&
+                                RecurringTaskSeries.IsDeadOccurrence(dead) &&
+                                string.Equals(
+                                    RecurringTaskSeries.GetSeriesId(dead),
+                                    seriesId, StringComparison.Ordinal))
+                                dead.Delete();
+                        }
+                        finally
+                        {
+                            Marshal.FinalReleaseComObject(dead);
+                        }
+                    }
+                }
+                master.Delete();
             }
 
             return Task.FromResult(true);

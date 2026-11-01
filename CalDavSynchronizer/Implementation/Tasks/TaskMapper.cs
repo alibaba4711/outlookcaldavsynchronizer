@@ -969,6 +969,7 @@ namespace CalDavSynchronizer.Implementation.Tasks
                     .GroupBy(item => item.Date.Value)
                     .ToDictionary(group => group.Key, group => group.Select(item => item.Task).ToList());
 
+            var preImportFolderTaskIds = SnapshotFolderTaskEntryIds(target.Inner, logger);
             var matchedExisting = new HashSet<TaskItem>();
 
             foreach (var sourceExceptionPair in completedSourceExceptions)
@@ -1039,6 +1040,124 @@ namespace CalDavSynchronizer.Implementation.Tasks
                 target.Inner,
                 completedSourceExceptions.Keys,
                 logger);
+            RemoveNewSkippedOpenOccurrences(
+                target.Inner,
+                seriesId,
+                preImportFolderTaskIds,
+                completedSourceExceptions.Keys,
+                logger);
+        }
+
+        // Snapshot the folder before importing exceptions: only new Outlook items
+        // created by this import may later be removed. Existing local changes stay safe.
+        private static HashSet<string> SnapshotFolderTaskEntryIds(
+            TaskItem master, IEntitySynchronizationLogger logger)
+        {
+            try
+            {
+                var folder = master.Parent as MAPIFolder;
+                if (folder == null)
+                    return null;
+                var result = new HashSet<string>(StringComparer.Ordinal);
+                var items = folder.Items;
+                for (var i = 1; i <= items.Count; i++)
+                {
+                    var task = items[i] as TaskItem;
+                    if (task != null && !string.IsNullOrEmpty(task.EntryID))
+                        result.Add(task.EntryID);
+                }
+                return result;
+            }
+            catch (COMException ex)
+            {
+                s_logger.Warn("Could not snapshot the Outlook task folder; skipping phantom occurrence cleanup.", ex);
+                logger.LogWarning("Could not snapshot the Outlook task folder; skipping phantom occurrence cleanup.", ex);
+                return null;
+            }
+        }
+
+        private static bool IsSameRecurringSeries(TaskItem task, string seriesId)
+        {
+            if (!task.IsRecurring || string.IsNullOrEmpty(seriesId))
+                return false;
+
+            var property = task.UserProperties.Find(RecurringTaskSeries.SeriesIdPropertyName);
+            return property != null &&
+                   string.Equals(Convert.ToString(property.Value), seriesId, StringComparison.Ordinal);
+        }
+
+        // SkipRecurrence() may materialize an additional *open* dead occurrence even
+        // though the corresponding completed RECURRENCE-ID was imported already.
+        // Remove only an item created during this import, in the same series/date,
+        // and only if a completed copy for that date is demonstrably present.
+        // Never touch a pre-existing local occurrence or the active series master.
+        private static void RemoveNewSkippedOpenOccurrences(
+            TaskItem master,
+            string seriesId,
+            HashSet<string> beforeImportIds,
+            IEnumerable<DateTime> completedRecurrenceDates,
+            IEntitySynchronizationLogger logger)
+        {
+            if (beforeImportIds == null || string.IsNullOrEmpty(seriesId))
+                return;
+
+            var completedDates = new HashSet<DateTime>(
+                completedRecurrenceDates.Select(date => date.Date));
+            if (completedDates.Count == 0)
+                return;
+
+            try
+            {
+                var folder = master.Parent as MAPIFolder;
+                if (folder == null)
+                    return;
+                var items = folder.Items;
+                var completedCopies = new HashSet<DateTime>();
+
+                for (var i = 1; i <= items.Count; i++)
+                {
+                    var task = items[i] as TaskItem;
+                    if (task == null || !task.Complete ||
+                        !RecurringTaskSeries.IsDeadOccurrence(task) ||
+                        !IsSameRecurringSeries(task, seriesId))
+                        continue;
+                    var occurrenceDate = GetOutlookRecurrenceExceptionDate(task);
+                    if (occurrenceDate.HasValue && completedDates.Contains(occurrenceDate.Value.Date))
+                        completedCopies.Add(occurrenceDate.Value.Date);
+                }
+
+                // Reverse order because deleting a task modifies MAPIFolder.Items.
+                for (var i = items.Count; i >= 1; i--)
+                {
+                    var task = items[i] as TaskItem;
+                    if (task == null || task.Complete ||
+                        string.IsNullOrEmpty(task.EntryID) ||
+                        beforeImportIds.Contains(task.EntryID) ||
+                        string.Equals(task.EntryID, master.EntryID, StringComparison.Ordinal) ||
+                        !RecurringTaskSeries.IsDeadOccurrence(task) ||
+                        !IsSameRecurringSeries(task, seriesId))
+                        continue;
+
+                    var occurrenceDate = GetOutlookRecurrenceExceptionDate(task);
+                    if (!occurrenceDate.HasValue ||
+                        !completedDates.Contains(occurrenceDate.Value.Date) ||
+                        !completedCopies.Contains(occurrenceDate.Value.Date))
+                        continue;
+
+                    var removedDate = occurrenceDate.Value.Date;
+                    task.Delete();
+                    s_logger.InfoFormat(
+                        "Removed newly created open dead occurrence {0:d} for recurring task series '{1}' (completed occurrence already exists).",
+                        removedDate, seriesId);
+                }
+            }
+            catch (COMException ex)
+            {
+                // Preserve data if Outlook refuses a read or delete. The user can
+                // inspect the duplicate rather than risk the whole sync run.
+                s_logger.Warn("Could not finish skipped-occurrence cleanup; manual review may be needed.", ex);
+                logger.LogWarning("Could not finish skipped-occurrence cleanup; manual review may be needed.", ex);
+            }
         }
 
         private void AdvanceMasterPastCompletedOccurrences(
